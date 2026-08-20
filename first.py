@@ -17,11 +17,11 @@ for neuron in layer.neurons:
 x = [Value(0.4), Value(0.3), Value(1.4)]
 
 # beklediğimiz çıktı
-target = [1.0, 1.0, 1.0, 1.0]
+target = [3.0, 4.0, 5.0, 6.0]
 
-train_cycles = 10
+train_cycles = 4000
 
-learning_rate = 0.01
+learning_rate = 0.000007
 
 while train_cycles > 0:
 
@@ -52,6 +52,7 @@ while train_cycles > 0:
             print("connection: ", j, " weight: ", w.data, " gradient: ", w.grad)
             # gradient descent olarak çıkan graientin tersine doğru eğitiyoruz
             w.data -= w.grad * learning_rate
+        neuron.b.data -= learning_rate * neuron.b.grad
 
 
     print("        ")
