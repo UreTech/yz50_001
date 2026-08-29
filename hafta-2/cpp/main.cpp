@@ -47,6 +47,7 @@ class uValueNode{
 
         uValueNode* create_copy(){
             uValueNode* copy = new uValueNode(*this);
+            copy->grad = 0.0f;
             return copy;
         }
 
@@ -88,15 +89,19 @@ class uValue{
 
         static void flush_uValue_pool(){
             for(size_t i = 0; i < ptrs.size(); i++){
+                uValueNode* node_ = (uValueNode*)ptrs[i];
+                node_->operations.clear();
+                node_->~uValueNode();
                 free(ptrs[i]);
             }
             ptrs.clear();
         }
 
-        static void flush_uValue_grad_pool(){
+        static void reset_uValue_backward_pool(){
             for(size_t i = 0; i < ptrs.size(); i++){
                 uValueNode* node_ = (uValueNode*)ptrs[i];
                 node_->grad = 0.0f;
+                node_->operations.clear(); // clear operations
             }
         }
 
@@ -174,7 +179,7 @@ class uValue{
         }
 
         uValue operator-(const uValue& other){
-            uValue *child = new uValue(this->node->value - other.node->value);
+            uValue child(this->node->value - other.node->value);
 
             // left & right
             operation_data op = {};
@@ -182,9 +187,9 @@ class uValue{
             op.right = other.node;
             op.op_type = operation_type::SUB;
 
-            child->node->operations.push_back(op);
+            child.node->operations.push_back(op);
 
-            return *child;
+            return child;
         }
 
         uValue& operator-=(const uValue& other){
@@ -203,7 +208,7 @@ class uValue{
         }
 
         uValue operator*(const uValue& other){
-            uValue *child = new uValue(this->node->value * other.node->value);
+            uValue child(this->node->value * other.node->value);
 
             // left & right
             operation_data op = {};
@@ -211,9 +216,9 @@ class uValue{
             op.right = other.node;
             op.op_type = operation_type::MUL;
 
-            child->node->operations.push_back(op);
+            child.node->operations.push_back(op);
 
-            return *child;
+            return child;
         }
 
         uValue& operator*=(const uValue& other){
@@ -232,7 +237,7 @@ class uValue{
         }
 
         uValue operator/(const uValue& other){
-            uValue *child = new uValue(this->node->value / other.node->value);
+            uValue child(this->node->value / other.node->value);
 
             // left & right
             operation_data op = {};
@@ -240,9 +245,9 @@ class uValue{
             op.right = other.node;
             op.op_type = operation_type::DIV;
 
-            child->node->operations.push_back(op);
+            child.node->operations.push_back(op);
 
-            return *child;
+            return child;
         }
 
         uValue& operator/=(const uValue& other){
@@ -428,8 +433,8 @@ class uMLP{
         uLayer output_layer;
 
         // NOTE: check layer sizes otherwise this function could cause segfault
-        std::vector<float> forward(float* input){
-            // convert input to uValue
+        std::vector<uValue> forward(float* input){
+            // convert inputs to uValue
             std::vector<uValue> input_values;
             for(size_t i = 0; i < input_layer.input_count; i++){
                 input_values.push_back(uValue(input[i]));
@@ -446,14 +451,50 @@ class uMLP{
             // output layer
             out = output_layer.forward_layer(out.data());
 
-            // convert output to float
-            std::vector<float> output_values;
-            for(size_t i = 0; i < out.size(); i++){
-                output_values.push_back(out[i].get_value());
+            return out;
+        }
+
+        void backward_training(float* target, uValue* output, float learning_rate){
+
+            // calculate losses
+            uValue total_loss;
+            for(size_t i = 0; i < output_layer.neurons.size(); i++){
+                uValue diff = (uValue(target[i]) - output[i]);
+                total_loss += diff * diff;
+            }
+            total_loss.backward();
+
+            // propagate backward (output layer)
+            for(size_t i = 0; i < output_layer.neurons.size(); i++){
+                for(size_t j = 0; j < output_layer.neurons[i].weights.size(); j++){
+                    // -= is not used because we dont want to keep history
+                    output_layer.neurons[i].weights[j] = (output_layer.neurons[i].weights[j] - (output_layer.neurons[i].weights[j].get_grad() * learning_rate)).get_value();
+                }
+                output_layer.neurons[i].bias = (output_layer.neurons[i].bias - (output_layer.neurons[i].bias.get_grad() * learning_rate)).get_value();
             }
 
-            return output_values;
+            // propagate backward (hidden layers)
+            for(size_t k = 0; k < hidden_layers.size(); k++){
+                for(size_t i = 0; i < hidden_layers[k].neurons.size(); i++){
+                    for(size_t j = 0; j < hidden_layers[k].neurons[i].weights.size(); j++){
+                        // -= is not used because we dont want to keep history
+                        hidden_layers[k].neurons[i].weights[j] = (hidden_layers[k].neurons[i].weights[j] - (hidden_layers[k].neurons[i].weights[j].get_grad() * learning_rate)).get_value();
+                    }
+                    hidden_layers[k].neurons[i].bias = (hidden_layers[k].neurons[i].bias - (hidden_layers[k].neurons[i].bias.get_grad() * learning_rate)).get_value();
+                }
+            }
+
+            // propagate backward (input layer)
+            for(size_t i = 0; i < input_layer.neurons.size(); i++){
+                for(size_t j = 0; j < input_layer.neurons[i].weights.size(); j++){
+                    // -= is not used because we dont want to keep history
+                    input_layer.neurons[i].weights[j] = (input_layer.neurons[i].weights[j] - (input_layer.neurons[i].weights[j].get_grad() * learning_rate)).get_value();
+                }
+                input_layer.neurons[i].bias = (input_layer.neurons[i].bias - (input_layer.neurons[i].bias.get_grad() * learning_rate)).get_value();
+            }
+
         }
+
 
 };
 
@@ -461,15 +502,30 @@ int main(){
 
     // setup mlp
     uMLP mlp;
-    mlp.input_layer = uLayer::create_layer(10, 10); // 10 input & 10 neurons
-    uLayer hidden0 = uLayer::create_layer(10, 16); // 10 input & 16 neuron
+    mlp.input_layer = uLayer::create_layer(4, 3); // 4 input & 3 neurons
+    uLayer hidden0 = uLayer::create_layer(3, 16); // 3 input & 16 neuron
     mlp.hidden_layers.push_back(hidden0);
     mlp.output_layer = uLayer::create_layer(16, 2); // 16 input & 2 neurons
     
-    // yetşimiyor lööööö :(
+    float inputs[] = {0.1f, 0.2f, 0.3f, 0.4f};
+    float targets[] = {0.03f, 0.01f};
 
+    size_t training_cycles = 1500;
+    while(training_cycles--){
+        std::vector<uValue> result = mlp.forward(inputs); // 4 input
+        mlp.backward_training(targets, result.data(), 0.0001f); // 2 output
+        uValue::reset_uValue_backward_pool(); // reset pool for next cycle
+    }
+
+    std::vector<uValue> result = mlp.forward(inputs); // 4 input
+
+    std::cout << "trained:\n";
+    for(size_t i = 0; i < result.size(); i++){
+        std::cout << i << ": " << result[i].get_value() << "\n";
+    }
+
+    // program end
     uValue::flush_uValue_pool();
-
     return 0;
 }
 
