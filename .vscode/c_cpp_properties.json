@@ -1,0 +1,23 @@
+{
+    "configurations": [
+        {
+            "name": "HIP",
+            "compilerPath": "/opt/rocm/llvm/bin/amdclang++",
+            "cppStandard": "c++20",
+            "intelliSenseMode": "linux-clang-x64",
+
+            "includePath": [
+                "${workspaceFolder}/**",
+                "/opt/rocm/include",
+                "/opt/rocm/llvm/lib/clang/17.0.0"
+            ],
+
+            "defines": [
+                "__HIP__=1",
+                "__HIP_PLATFORM_AMD__=1",
+                "HIP_TEMPLATE_KERNEL_LAUNCH=1"
+            ]
+        }
+    ],
+    "version": 4
+}
