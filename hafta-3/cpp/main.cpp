@@ -8,11 +8,22 @@
 #include <numbers>
 #include <random>
 #include <cstdio>
+#include <fstream>
+#include <sstream>
 
 #define UNODE_DEVICE_BUFFER_ENABLE_OVERFLOW_WARNINGS true
 
 #define UValueNodePool_chunk_allocate_count (512ULL)
 #define UValueNodePool_gpu_chunk_allocate_count (2048ULL * 16ULL) // larger for not wasting gpu
+
+#define dbg() (std::cout << "hit@" << __FILE__ << ":" << __LINE__ << "\n");
+
+#define HIP_CHECK(call) do { \
+    hipError_t err = call; \
+    if(err != hipSuccess){ \
+        std::cerr << "HIP ERROR at " << __FILE__ << ":" << __LINE__ << " -> " << hipGetErrorString(err) << "\n"; \
+    } \
+} while(0)
 
 float random_float(float min, float max)
 {
@@ -25,13 +36,15 @@ float random_float(float min, float max)
 }
 
 typedef enum{
+    UNDEFINED_OPERATION,
     ADD,
     SUB,
     DIV,
     MUL,
     TANH,
     POW,
-    UNDEFINED,
+    LOG,
+    SIGMOID,
 }operation_type;
 
 // forward decs
@@ -42,7 +55,7 @@ class uValueNode;
 
 struct uNodePool{
     std::vector<uValueNode> uValue_pool;
-    uint64_t next = 0; // last available node
+    uint64_t next = 1; // last available node (node 0 reserved for overflow handling)
     uint64_t temp_start = 0;
     bool temp_enabled = false;
 };
@@ -88,9 +101,9 @@ typedef unsigned long long uNodeIdx; // uValueNode index in pool table
 
 struct operation_data
 {
-        uNodeIdx left = UINT64_MAX;
-        uNodeIdx right = UINT64_MAX;
-        operation_type op_type = operation_type::UNDEFINED;
+        uNodeIdx left = INVALID_NODE;
+        uNodeIdx right = INVALID_NODE;
+        operation_type op_type = operation_type::UNDEFINED_OPERATION;
 };
 
 class uValueNode{
@@ -166,7 +179,7 @@ class uValueNode{
 
 bool uNodePool_copy_device_to_host(){
     // firstly get device pool
-    hipMemcpyFromSymbol(&gpu_pool_host_copy, HIP_SYMBOL(gpu_pool), sizeof(gpu_uNodePool), 0, hipMemcpyDeviceToHost);
+    HIP_CHECK(hipMemcpyFromSymbol(&gpu_pool_host_copy, HIP_SYMBOL(gpu_pool), sizeof(gpu_uNodePool), 0, hipMemcpyDeviceToHost));
 
     if(gpu_pool_host_copy.overflowed){
         #if UNODE_DEVICE_BUFFER_ENABLE_OVERFLOW_WARNINGS
@@ -180,7 +193,7 @@ bool uNodePool_copy_device_to_host(){
 
     // then copy pool content in to host pool
     pool.uValue_pool.resize(gpu_pool_host_copy.pool_size);
-    hipMemcpy(pool.uValue_pool.data(), gpu_pool_host_copy.uValue_pool, sizeof(uValueNode) * pool.uValue_pool.size(), hipMemcpyDeviceToHost);
+    HIP_CHECK(hipMemcpy(pool.uValue_pool.data(), gpu_pool_host_copy.uValue_pool, sizeof(uValueNode) * pool.uValue_pool.size(), hipMemcpyDeviceToHost));
 
     pool.next = gpu_pool_host_copy.next;
 
@@ -196,11 +209,11 @@ void uNodePool_copy_host_to_device(){
             gpu_pool_host_copy.pool_size = pool.uValue_pool.size();
 
             if(gpu_pool_host_copy.uValue_pool == nullptr){
-                hipMalloc(&gpu_pool_host_copy.uValue_pool, gpu_pool_host_copy.pool_size * sizeof(uValueNode));
+                HIP_CHECK(hipMalloc(&gpu_pool_host_copy.uValue_pool, gpu_pool_host_copy.pool_size * sizeof(uValueNode)));
             }else{
-                hipFree(gpu_pool_host_copy.uValue_pool);
+                HIP_CHECK(hipFree(gpu_pool_host_copy.uValue_pool));
                 gpu_pool_host_copy.uValue_pool = nullptr;
-                hipMalloc(&gpu_pool_host_copy.uValue_pool, gpu_pool_host_copy.pool_size * sizeof(uValueNode));
+                HIP_CHECK(hipMalloc(&gpu_pool_host_copy.uValue_pool, gpu_pool_host_copy.pool_size * sizeof(uValueNode)));
             }
 
         }
@@ -209,7 +222,7 @@ void uNodePool_copy_host_to_device(){
             std::cout << "ERROR: Failed to allocate gpu node table!\n";
         }
     }else{
-        hipFree(gpu_pool_host_copy.uValue_pool);
+        HIP_CHECK(hipFree(gpu_pool_host_copy.uValue_pool));
         gpu_pool_host_copy.pool_size = 0;
         gpu_pool_host_copy.uValue_pool = nullptr;
     }
@@ -217,10 +230,10 @@ void uNodePool_copy_host_to_device(){
     gpu_pool_host_copy.next = pool.next;
 
     // then copy pool content in to device pool
-    hipMemcpy(gpu_pool_host_copy.uValue_pool, pool.uValue_pool.data(), sizeof(uValueNode) * gpu_pool_host_copy.pool_size, hipMemcpyHostToDevice);
+    HIP_CHECK(hipMemcpy(gpu_pool_host_copy.uValue_pool, pool.uValue_pool.data(), sizeof(uValueNode) * gpu_pool_host_copy.pool_size, hipMemcpyHostToDevice));
 
     // finaly copy host pool to device
-    hipMemcpyToSymbol(HIP_SYMBOL(gpu_pool), &gpu_pool_host_copy, sizeof(gpu_uNodePool), 0, hipMemcpyHostToDevice);
+    HIP_CHECK(hipMemcpyToSymbol(HIP_SYMBOL(gpu_pool), &gpu_pool_host_copy, sizeof(gpu_uNodePool), 0, hipMemcpyHostToDevice));
 
     // done!
 }
@@ -228,7 +241,7 @@ void uNodePool_copy_host_to_device(){
 class uValue{
     public:
 
-        uNodeIdx node = UINT64_MAX;
+        uNodeIdx node = INVALID_NODE;
 
         __host__ __device__
         uValue(float val){
@@ -292,8 +305,25 @@ class uValue{
             // left & right
             operation_data op = {};
             op.left = this->node;
-            op.right = UINT64_MAX;
+            op.right = INVALID_NODE;
             op.op_type = operation_type::TANH;
+
+            uValueNode::get_node(child.node)->parent_operation = op;
+
+            return child;
+        }
+        
+        __host__ __device__
+        uValue sigmoid(){
+
+            // sigmoid formula
+            uValue child(1.0f / (1.0f + ::exp(-(uValueNode::get_node(this->node)->value))));
+
+            // left & right
+            operation_data op = {};
+            op.left = this->node;
+            op.right = INVALID_NODE;
+            op.op_type = operation_type::SIGMOID;
 
             uValueNode::get_node(child.node)->parent_operation = op;
 
@@ -310,6 +340,25 @@ class uValue{
             op.left = this->node;
             op.right = power.node;
             op.op_type = operation_type::POW;
+
+            uValueNode::get_node(child.node)->parent_operation = op;
+
+            return child;
+        }
+       
+        __host__ __device__
+        uValue log(){
+            float v = uValueNode::get_node(this->node)->value;
+
+            float safe_v = v < 1e-7f ? 1e-7f : v;
+
+            uValue child(::log(safe_v));
+
+            // left & right
+            operation_data op = {};
+            op.left = this->node;
+            op.right = INVALID_NODE;
+            op.op_type = operation_type::LOG;
 
             uValueNode::get_node(child.node)->parent_operation = op;
 
@@ -460,7 +509,7 @@ class uValue{
         __host__
         std::string dump_parents(){
             std::string result = "";
-            if(uValueNode::get_node(this->node)->parent_operation.op_type == operation_type::UNDEFINED){
+            if(uValueNode::get_node(this->node)->parent_operation.op_type == operation_type::UNDEFINED_OPERATION){
                 result += "{[val]: " + std::to_string(uValueNode::get_node(this->node)->value) + " [grad]: " + std::to_string(uValueNode::get_node(this->node)->grad) + "}";
             }
 
@@ -489,6 +538,14 @@ class uValue{
 
             case TANH:
                 result += ("tanh(" + uValue::from_node(uValueNode::get_node(this->node)->parent_operation.left).dump_parents() + ")");
+                break; 
+
+            case LOG:
+                result += ("log(" + uValue::from_node(uValueNode::get_node(this->node)->parent_operation.left).dump_parents() + ")");
+                break;
+
+            case SIGMOID:
+                result += ("sigmoid(" + uValue::from_node(uValueNode::get_node(this->node)->parent_operation.left).dump_parents() + ")");
                 break;
             
             default:
@@ -538,16 +595,26 @@ class uValue{
                 uValue::from_node(uValueNode::get_node(this->node)->parent_operation.right).backward(false);
                 break;
 
-            case TANH:
-                uValueNode::get_node(uValueNode::get_node(this->node)->parent_operation.left)->grad += (1.0f - std::pow(uValueNode::get_node(this->node)->value, 2)) * uValueNode::get_node(this->node)->grad;
-                uValue::from_node(uValueNode::get_node(this->node)->parent_operation.left).backward(false);
-                break;
-
             case POW:
                 uValueNode::get_node(uValueNode::get_node(this->node)->parent_operation.left)->grad += uValueNode::get_node(uValueNode::get_node(this->node)->parent_operation.right)->value * ::pow(uValueNode::get_node(uValueNode::get_node(this->node)->parent_operation.left)->value, uValueNode::get_node(uValueNode::get_node(this->node)->parent_operation.right)->value - 1.0f) * uValueNode::get_node(this->node)->grad;
                 uValueNode::get_node(uValueNode::get_node(this->node)->parent_operation.right)->grad += uValueNode::get_node(this->node)->value * ::log(uValueNode::get_node(uValueNode::get_node(this->node)->parent_operation.left)->value) * uValueNode::get_node(this->node)->grad;
                 uValue::from_node(uValueNode::get_node(this->node)->parent_operation.left).backward(false);
                 uValue::from_node(uValueNode::get_node(this->node)->parent_operation.right).backward(false);
+                break;
+
+            case TANH:
+                uValueNode::get_node(uValueNode::get_node(this->node)->parent_operation.left)->grad += (1.0f - std::pow(uValueNode::get_node(this->node)->value, 2)) * uValueNode::get_node(this->node)->grad;
+                uValue::from_node(uValueNode::get_node(this->node)->parent_operation.left).backward(false);
+                break;
+
+            case LOG:
+                uValueNode::get_node(uValueNode::get_node(this->node)->parent_operation.left)->grad += (1.0f / uValueNode::get_node(uValueNode::get_node(this->node)->parent_operation.left)->value) * uValueNode::get_node(this->node)->grad;
+                uValue::from_node(uValueNode::get_node(this->node)->parent_operation.left).backward(false);
+                break;  
+
+            case SIGMOID:
+                uValueNode::get_node(uValueNode::get_node(this->node)->parent_operation.left)->grad += (uValueNode::get_node(this->node)->value * (1.0f - uValueNode::get_node(this->node)->value)) * uValueNode::get_node(this->node)->grad;
+                uValue::from_node(uValueNode::get_node(this->node)->parent_operation.left).backward(false);
                 break;
             
             default:
@@ -569,25 +636,25 @@ class uNeuron{
             uNeuron neuron;
             neuron.weight_count = input_count;
             neuron.weights = new uValue[neuron.weight_count];
-            hipMalloc(&(neuron.weights_device_buffer), neuron.weight_count * sizeof(uValue));
+            HIP_CHECK(hipMalloc(&(neuron.weights_device_buffer), neuron.weight_count * sizeof(uValue)));
 
             if(neuron.weights_device_buffer == nullptr){
                 std::cout << "ERROR: Failed to allocate gpu neuron buffer!\n";
             }
 
             for(size_t i = 0; i < neuron.weight_count; i++){
-                neuron.weights[i] = random_float(-0.3f, 0.7f);
+                neuron.weights[i] = random_float(0.01f, 0.7f);
             }
-            neuron.bias = random_float(-1.0f, 1.0f);
+            neuron.bias = random_float(0.1f, 1.0f);
             return neuron;
         }
 
         void copy_neuron_to_device(){
-            hipMemcpy(weights_device_buffer, weights, sizeof(uValue) * weight_count, hipMemcpyHostToDevice);
+            HIP_CHECK(hipMemcpy(weights_device_buffer, weights, sizeof(uValue) * weight_count, hipMemcpyHostToDevice));
         }
 
         void copy_neuron_to_host(){
-            hipMemcpy(weights, weights_device_buffer, sizeof(uValue) * weight_count, hipMemcpyDeviceToHost);
+            HIP_CHECK(hipMemcpy(weights, weights_device_buffer, sizeof(uValue) * weight_count, hipMemcpyDeviceToHost));
         }
 };
 
@@ -599,10 +666,10 @@ void _forward_layer_gpu_thread_(uValue* input, uValue output_start, uNeuron* neu
         // calculate neuron output
         uValue y = 0.0f;
         for(size_t j = 0; j < neurons[id].weight_count; j++){
-            y += (neurons[id].weights_device_buffer[j] * input[id]);
+            y += (neurons[id].weights_device_buffer[j] * input[j]);
         }
         y += neurons[id].bias;
-        uValue::from_node(output_start.node + id) = y.tanh();
+        uValue::from_node(output_start.node + id) = y.sigmoid();
     }
 }
 
@@ -616,29 +683,69 @@ void _train_neuron_gpu_thread_(float learning_rate, uNeuron* neurons, size_t neu
         }
         neurons[id].bias = (neurons[id].bias - (neurons[id].bias.get_grad() * learning_rate)).get_value();
     }
-} 
+}
+
+typedef enum{
+    UNDEFINED_NNETWORK,
+    MLP,
+    RNN,
+}uNNetwork_type;
 
 class uLayer{
     public:
-        size_t input_count;
-        size_t neuron_count;
+        uNNetwork_type type = uNNetwork_type::UNDEFINED_NNETWORK;
+        size_t input_count = 0;
+        size_t neuron_count = 0;
         uNeuron* neurons = nullptr;
         uNeuron* neurons_device_buffer = nullptr;
 
-        static uLayer create_layer(size_t input_count, size_t neuron_count){
+        // rnn specific
+        size_t total_input_count = 0;
+        size_t h_input_count = 0;
+        uValue* rnn_total_input = nullptr;
+
+        static uLayer create_mlp_layer(size_t input_count, size_t neuron_count){
             uLayer layer;
+            layer.type = uNNetwork_type::MLP;
             layer.input_count = input_count;
             layer.neuron_count = neuron_count;
             layer.neurons = new uNeuron[layer.neuron_count];
+            layer.total_input_count  = input_count;
+            layer.h_input_count = 0;
+            layer.rnn_total_input = nullptr;
 
-            hipMalloc(&(layer.neurons_device_buffer), neuron_count * sizeof(uNeuron));
+            HIP_CHECK(hipMalloc(&(layer.neurons_device_buffer), neuron_count * sizeof(uNeuron)));
 
             if(layer.neurons_device_buffer == nullptr){
                 std::cout << "ERROR: Failed to allocate gpu neurons buffer!\n";
             }
 
             for(size_t i = 0; i < neuron_count; i++){
-                layer.neurons[i] = uNeuron::create_neuron(input_count);
+                layer.neurons[i] = uNeuron::create_neuron(layer.total_input_count);
+            }
+
+            return layer;
+        }
+
+        static uLayer create_rnn_layer(size_t input_count, size_t neuron_count){
+            uLayer layer;
+            layer.type = uNNetwork_type::RNN;
+            layer.input_count = input_count;
+            layer.neuron_count = neuron_count;
+            layer.neurons = new uNeuron[layer.neuron_count];
+            layer.total_input_count  = input_count + neuron_count;
+            layer.h_input_count = neuron_count;
+
+            layer.rnn_total_input = new uValue[layer.total_input_count];
+
+            HIP_CHECK(hipMalloc(&(layer.neurons_device_buffer), neuron_count * sizeof(uNeuron)));
+
+            if(layer.neurons_device_buffer == nullptr){
+                std::cout << "ERROR: Failed to allocate gpu neurons buffer!\n";
+            }
+
+            for(size_t i = 0; i < neuron_count; i++){
+                layer.neurons[i] = uNeuron::create_neuron(layer.total_input_count);
             }
 
             return layer;
@@ -648,14 +755,14 @@ class uLayer{
             for(size_t i = 0; i < neuron_count; i++){
                 neurons[i].copy_neuron_to_device();
             }
-            hipMemcpy(neurons_device_buffer, neurons, neuron_count * sizeof(uNeuron), hipMemcpyHostToDevice);
+            HIP_CHECK(hipMemcpy(neurons_device_buffer, neurons, neuron_count * sizeof(uNeuron), hipMemcpyHostToDevice));
         }
 
         void copy_neurons_to_host(){
             for(size_t i = 0; i < neuron_count; i++){
                 neurons[i].copy_neuron_to_host();
             }
-            hipMemcpy(neurons, neurons_device_buffer, neuron_count * sizeof(uNeuron), hipMemcpyDeviceToHost);
+            HIP_CHECK(hipMemcpy(neurons, neurons_device_buffer, neuron_count * sizeof(uNeuron), hipMemcpyDeviceToHost));
         }
 
         __host__
@@ -670,7 +777,7 @@ class uLayer{
 
                 hipLaunchKernelGGL(_train_neuron_gpu_thread_, dim3(blocks), dim3(threads_per_block), 0, 0, learning_rate, this->neurons_device_buffer, this->neuron_count);
 
-                hipDeviceSynchronize();
+                HIP_CHECK(hipDeviceSynchronize());
 
                 if(uNodePool_copy_device_to_host()){
                     copy_neurons_to_host();
@@ -679,17 +786,37 @@ class uLayer{
             }
         }
 
+        void reset_hidden_rnn(){
+            if(this->type == uNNetwork_type::RNN){
+                for(size_t i = this->input_count; i < this->total_input_count; i++){
+                    this->rnn_total_input[i] = 0.0f;
+                }
+            }
+        }
+
         std::vector<uValue> forward_layer(uValue* input){
             std::vector<uValue> output(this->neuron_count); // output
 
+            // copy input to total buffer if layer is RNN
+            if(this->type == uNNetwork_type::RNN){
+                for(size_t i = 0; i < this->input_count; i++){
+                    this->rnn_total_input[i] = input[i];
+                }
+            }
+
             // input
             uValue* input_device_buffer = nullptr;
-            hipMalloc(&input_device_buffer, sizeof(uValue) * this->input_count);
+            HIP_CHECK(hipMalloc(&input_device_buffer, sizeof(uValue) * this->total_input_count));
             if(input_device_buffer == nullptr){
                 std::cout << "ERROR: Failed to allocate gpu input device buffer!\n";
                 return output;
             }
-            hipMemcpy(input_device_buffer, input, sizeof(uValue) * this->input_count, hipMemcpyHostToDevice);
+            // copy total buffer to device if layer is RNN
+            if(this->type == uNNetwork_type::RNN){
+                HIP_CHECK(hipMemcpy(input_device_buffer, this->rnn_total_input, sizeof(uValue) * this->total_input_count, hipMemcpyHostToDevice));
+            }else{
+                HIP_CHECK(hipMemcpy(input_device_buffer, input, sizeof(uValue) * this->total_input_count, hipMemcpyHostToDevice));
+            }
             
             copy_neurons_to_device();
 
@@ -703,11 +830,20 @@ class uLayer{
 
                 hipLaunchKernelGGL(_forward_layer_gpu_thread_, dim3(blocks), dim3(threads_per_block), 0, 0, input_device_buffer, output[0], this->neurons_device_buffer, this->neuron_count);
 
-                hipDeviceSynchronize();
+                HIP_CHECK(hipDeviceSynchronize());
 
                 // read back to host
                 if(uNodePool_copy_device_to_host() == true){
                     copy_neurons_to_host();
+
+                    // copy output to total buffer if layer is RNN
+                    // note: get value used because we dont want to copy history
+                    if(this->type == uNNetwork_type::RNN){
+                        for(size_t i = this->input_count; i < this->total_input_count; i++){
+                            this->rnn_total_input[i] = output[i - this->input_count].get_value();
+                        }
+                    }
+
                     break;
                 }
                 #if UNODE_DEVICE_BUFFER_ENABLE_OVERFLOW_WARNINGS
@@ -715,16 +851,69 @@ class uLayer{
                 #endif
             }
 
-            hipFree(input_device_buffer);
+            HIP_CHECK(hipFree(input_device_buffer));
             return output;
         }
 };
 
-class uMLP{
+typedef enum{
+    UNDEFINED_LOSS_TYPE,
+    MSE,
+    NLL,
+}uNNetwork_loss_type;
+
+class uNNetwork{
     public:
         uLayer input_layer;
         std::vector<uLayer> hidden_layers;
         uLayer output_layer;
+        uNNetwork_type type = uNNetwork_type::UNDEFINED_NNETWORK;
+
+        static uNNetwork create_MLP(size_t input_count, size_t input_neuron_count, size_t output_neuron_count, size_t* hidden_layer_neuron_counts, size_t hidden_layer_count){
+            uNNetwork network;
+            network.type = uNNetwork_type::MLP;
+            network.input_layer = uLayer::create_mlp_layer(input_count, input_neuron_count);
+
+            size_t last_layer_output_count = input_neuron_count;
+
+            for(size_t i = 0; i < hidden_layer_count; i++){
+                uLayer hidden = uLayer::create_mlp_layer(last_layer_output_count, hidden_layer_neuron_counts[i]);
+                network.hidden_layers.push_back(hidden);
+                last_layer_output_count = hidden_layer_neuron_counts[i];
+            }
+
+            network.output_layer = uLayer::create_mlp_layer(last_layer_output_count, output_neuron_count);
+
+            return network;
+        }
+
+        static uNNetwork create_RNN(size_t input_count, size_t input_neuron_count, size_t output_neuron_count, size_t* hidden_layer_neuron_counts, size_t hidden_layer_count){
+            uNNetwork network;
+            network.type = uNNetwork_type::RNN;
+            network.input_layer = uLayer::create_rnn_layer(input_count, input_neuron_count);
+
+            size_t last_layer_output_count = input_neuron_count;
+
+            for(size_t i = 0; i < hidden_layer_count; i++){
+                uLayer hidden = uLayer::create_rnn_layer(last_layer_output_count, hidden_layer_neuron_counts[i]);
+                network.hidden_layers.push_back(hidden);
+                last_layer_output_count = hidden_layer_neuron_counts[i];
+            }
+
+            network.output_layer = uLayer::create_rnn_layer(last_layer_output_count, output_neuron_count);
+
+            return network;
+        }
+
+        void reset_hidden_rnn(){
+            if(this->type == uNNetwork_type::RNN){
+                input_layer.reset_hidden_rnn();
+                for(size_t i = 0; i < hidden_layers.size(); i++){
+                    hidden_layers[i].reset_hidden_rnn();
+                }
+                output_layer.reset_hidden_rnn();
+            }
+        }
 
         // NOTE: check layer sizes otherwise this function could cause segfault
         std::vector<uValue> forward(float* input){
@@ -748,13 +937,28 @@ class uMLP{
             return out;
         }
 
-        void backward_training(float* target, uValue* output, float learning_rate){
+        void backward_training(float* target, uValue* output, float learning_rate, uNNetwork_loss_type loss_calc_type = uNNetwork_loss_type::MSE, size_t NLL_target_neuron = 0){
 
             // calculate losses
             uValue total_loss;
-            for(size_t i = 0; i < output_layer.neuron_count; i++){
-                uValue diff = (uValue(target[i]) - output[i]);
-                total_loss += diff * diff;
+            if(loss_calc_type == uNNetwork_loss_type::MSE){
+                // mean squarred error
+                for(size_t i = 0; i < output_layer.neuron_count; i++){
+                    uValue diff = (uValue(target[i]) - output[i]);
+                    total_loss += diff * diff;
+                }
+            }else if(loss_calc_type == uNNetwork_loss_type::NLL){
+                // negetive log likelihood
+                for(size_t i = 0; i < output_layer.neuron_count; i++){
+                    if(i == NLL_target_neuron){
+                        total_loss += (output[i].log() * -1.0f);
+                    }else{
+                        uValue one(1.0f);
+                        total_loss += ((one - output[i]).log() * -1.0f);
+                    }
+                }
+            }else{
+                std::cout << "ERROR: Unknown loss calculation type!\n";
             }
             total_loss.backward();
 
@@ -774,54 +978,118 @@ class uMLP{
 
 };
 
+struct bigram{
+    uint8_t key;
+    uint8_t target;
+};
+
+#define START_TOK (27ULL)
+#define END_TOK (26ULL)
+
+std::vector<bigram> bigrams;
+
+void read_bigrams(const char* path){
+    std::ifstream file(path);
+    std::stringstream buffer;
+    buffer << file.rdbuf();
+    std::string content = buffer.str();
+
+    size_t len = 0;
+    uint8_t last = START_TOK;
+    for(size_t i = 0; i < content.size(); i++){
+        if(content[i] <= 'z' && content[i] >= 'a'){
+            len++;
+
+            bigram bg;
+            bg.key = last;
+            bg.target = content[i] - 'a';
+            bigrams.push_back(bg);
+        
+            last = content[i] - 'a';
+        }else if(content[i] == '\n'){
+            if(len != 0){
+                bigram bg;
+                bg.key = last;
+                bg.target = END_TOK;
+                bigrams.push_back(bg);
+            }
+            len = 0;
+            last = START_TOK;
+        }
+    }
+}
+
 int main(){
 
-    // setup mlp
-    uMLP mlp;
-    mlp.input_layer = uLayer::create_layer(4, 3); // 4 input & 3 neurons
-    uLayer hidden0 = uLayer::create_layer(3, 4); // 3 input & 16 neuron
-    mlp.hidden_layers.push_back(hidden0);
-    mlp.output_layer = uLayer::create_layer(4, 2); // 16 input & 2 neurons
-    
-    float inputs1[] = {1.0f, 1.0f, 1.0f, 1.0f};
-    float targets1[] = {-1.0f, 1.0f};
+    read_bigrams("names.txt");
 
-    float inputs2[] = {-1.0f, -1.0f, -1.0f, -1.0f};
-    float targets2[] = {1.0f, -1.0f};
+    std::cout << "bigrams read!\n";
 
-    size_t training_cycles = 4000;
-    bool gio = false;
-    while(training_cycles--){
-        float *inputs;
-        float *targets;
-        if(gio){
-            inputs = inputs1;
-            targets = targets1;
-        }else{
-            inputs = inputs2;
-            targets = targets2;
-        }
-        gio = !gio;
+    /*
+    for(int i= 0; i < bigrams.size(); i++){
+        std::cout << i << ". {" << (int)bigrams[i].key << ", " << (int)bigrams[i].target << "}\n";
+    }
+    */
+
+    // setup rnn
+    size_t hiddens[1] = {16};
+    uNNetwork rnn = uNNetwork::create_RNN(28, 18, 28, hiddens, 1);
+
+    for(size_t i = 0; i < bigrams.size(); i++){
+        float input[28] = {};
+        float target[28] = {};
+
+        input[bigrams[i].key] = 1.0f;
+        target[bigrams[i].target] = 1.0f;
 
         uNodePool_temp_begin();
-        std::vector<uValue> result = mlp.forward(inputs); // 4 input
-        mlp.backward_training(targets, result.data(), 0.08f); // 2 output
+
+        std::vector<uValue> result = rnn.forward(input); // 28 input
+
+        //rnn.backward_training(target, result.data(), 0.08f);
+
+        rnn.backward_training(target, result.data(), 0.08f, uNNetwork_loss_type::NLL, bigrams[i].target);
+
         uValue::reset_uValue_backward_pool(); // reset pool for next cycle
+
+        if(bigrams[i].target == END_TOK){
+           rnn.reset_hidden_rnn();
+        }
+
         uNodePool_temp_end();
+
+        //if((((bigrams.size() * 100) / i) % 10) == 0){
+            //std::cout << "INFO: " << ((bigrams.size() * 100) / i) << "% trained...\n";
+        //}
     }
 
-    std::vector<uValue> result = mlp.forward(inputs1); // 4 input
+    std::cout << "INFO: training completed!\n";
 
-    std::cout << "trained1:\n";
-    for(size_t i = 0; i < result.size(); i++){
-        std::cout << i << ": " << result[i].get_value() << "\n";
-    }
+    // generate words
+    size_t generated = 0;
+    uint8_t last = START_TOK;
+    while (generated < 5)
+    {
+        float input[28] = {};
+        input[last] = 1.0f;
 
-    result = mlp.forward(inputs2); // 4 input
+        std::vector<uValue> result = rnn.forward(input); // 4 input
 
-    std::cout << "trained2:\n";
-    for(size_t i = 0; i < result.size(); i++){
-        std::cout << i << ": " << result[i].get_value() << "\n";
+        uint8_t biggest = 0;
+        for(size_t i = 0; i < result.size(); i++){
+            if(result[i].get_value() >= result[biggest].get_value()){
+                biggest = i;
+            }
+        }
+
+        if(biggest == END_TOK){
+            last = START_TOK;
+            std::cout << "\n";
+
+        }else{
+            std::cout << (char)(last + 'a');
+        }
+
     }
 
     // program end

@@ -23,7 +23,7 @@ typedef enum{
     MUL,
     TANH,
     POW,
-    UNDEFINED,
+    UNDEFINED_OPERATION,
 }operation_type;
 
 // forward decs
@@ -34,7 +34,7 @@ struct operation_data
 {
         uValueNode* left = nullptr;
         uValueNode* right = nullptr;
-        operation_type op_type = operation_type::UNDEFINED;
+        operation_type op_type = operation_type::UNDEFINED_OPERATION;
 };
 
 std::vector<void*> ptrs;
@@ -399,7 +399,7 @@ class uLayer{
         size_t input_count;
         std::vector<uNeuron> neurons;
 
-        static uLayer create_layer(size_t input_count, size_t neuron_count){
+        static uLayer create_mlp_layer(size_t input_count, size_t neuron_count){
             uLayer layer;
             layer.input_count = input_count;
             layer.neurons.resize(neuron_count);
@@ -426,7 +426,7 @@ class uLayer{
         }
 };
 
-class uMLP{
+class uNNetwork{
     public:
         uLayer input_layer;
         std::vector<uLayer> hidden_layers;
@@ -501,11 +501,11 @@ class uMLP{
 int main(){
 
     // setup mlp
-    uMLP mlp;
-    mlp.input_layer = uLayer::create_layer(4, 3); // 4 input & 3 neurons
-    uLayer hidden0 = uLayer::create_layer(3, 16); // 3 input & 16 neuron
+    uNNetwork mlp;
+    mlp.input_layer = uLayer::create_mlp_layer(4, 3); // 4 input & 3 neurons
+    uLayer hidden0 = uLayer::create_mlp_layer(3, 16); // 3 input & 16 neuron
     mlp.hidden_layers.push_back(hidden0);
-    mlp.output_layer = uLayer::create_layer(16, 2); // 16 input & 2 neurons
+    mlp.output_layer = uLayer::create_mlp_layer(16, 2); // 16 input & 2 neurons
     
     float inputs[] = {0.1f, 0.2f, 0.3f, 0.4f};
     float targets[] = {0.03f, 0.01f};
