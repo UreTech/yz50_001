@@ -13,8 +13,8 @@
 
 #define UNODE_DEVICE_BUFFER_ENABLE_OVERFLOW_WARNINGS true
 
-#define UValueNodePool_chunk_allocate_count (512ULL)
-#define UValueNodePool_gpu_chunk_allocate_count (2048ULL * 16ULL) // larger for not wasting gpu
+#define UValueNodePool_chunk_allocate_count (2048ULL * 32ULL)
+#define UValueNodePool_gpu_chunk_allocate_count (2048ULL * 128ULL) // larger for not wasting gpu
 
 #define dbg() (std::cout << "hit@" << __FILE__ << ":" << __LINE__ << "\n");
 
@@ -1031,30 +1031,23 @@ int main(){
     }
     */
 
-    // setup rnn
-    size_t hiddens[1] = {16};
-    uNNetwork rnn = uNNetwork::create_RNN(28, 18, 28, hiddens, 1);
+    // setup
+    uLayer n = uLayer::create_mlp_layer(28, 28);
 
     for(size_t i = 0; i < bigrams.size(); i++){
-        float input[28] = {};
-        float target[28] = {};
-
-        input[bigrams[i].key] = 1.0f;
-        target[bigrams[i].target] = 1.0f;
-
         uNodePool_temp_begin();
 
-        std::vector<uValue> result = rnn.forward(input); // 28 input
+        uValue input[28] = {};
 
-        //rnn.backward_training(target, result.data(), 0.08f);
+        input[bigrams[i].key] = 1.0f;
 
-        rnn.backward_training(target, result.data(), 0.08f, uNNetwork_loss_type::NLL, bigrams[i].target);
+        std::vector<uValue> result = n.forward_layer(input); // 28 input
+
+        uValue loss = (result[bigrams[i].target].log() * -1.0f);
+
+        n.train(0.08f);
 
         uValue::reset_uValue_backward_pool(); // reset pool for next cycle
-
-        if(bigrams[i].target == END_TOK){
-           rnn.reset_hidden_rnn();
-        }
 
         uNodePool_temp_end();
 
@@ -1070,10 +1063,12 @@ int main(){
     uint8_t last = START_TOK;
     while (generated < 5)
     {
-        float input[28] = {};
+        uNodePool_temp_begin();
+
+        uValue input[28] = {};
         input[last] = 1.0f;
 
-        std::vector<uValue> result = rnn.forward(input); // 4 input
+        std::vector<uValue> result = n.forward_layer(input); // 4 input
 
         uint8_t biggest = 0;
         for(size_t i = 0; i < result.size(); i++){
@@ -1087,8 +1082,10 @@ int main(){
             std::cout << "\n";
 
         }else{
-            std::cout << (char)(last + 'a');
+            std::cout << (char)(biggest + 'a');
         }
+
+        uNodePool_temp_end();
 
     }
 
