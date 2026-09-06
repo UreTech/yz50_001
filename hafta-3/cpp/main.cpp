@@ -133,8 +133,9 @@ class uValueNode{
                 // report over flow to cpu
                 atomicExch(&(gpu_pool.overflowed), true);
                 atomicMin(&gpu_pool.overflow_index, blockIdx.x * blockDim.x + threadIdx.x);
+                printf("pool over flowed\n");
+                __builtin_trap();
                 return INVALID_NODE;
-
             }
             gpu_pool.uValue_pool[new_node_idx] = *this;
             return new_node_idx;
@@ -147,6 +148,7 @@ class uValueNode{
             // check pool is large enough
             if(new_node_idx >= pool.uValue_pool.size()){
                 pool.uValue_pool.resize(pool.uValue_pool.size() + UValueNodePool_chunk_allocate_count);
+                printf("pool over flowed2\n");
             }
             return new_node_idx;
         }
@@ -158,8 +160,11 @@ class uValueNode{
             // check pool is large enough
             if(new_node_idx >= gpu_pool.pool_size){
                 // report over flow to cpu
+                printf("pool over flowed3\n");
                 atomicExch(&(gpu_pool.overflowed), true);
                 atomicMin(&gpu_pool.overflow_index, blockIdx.x * blockDim.x + threadIdx.x);
+                printf("pool over flowed4\n");
+                __builtin_trap();
                 return INVALID_NODE;
             }
             return new_node_idx;
@@ -172,6 +177,10 @@ class uValueNode{
 
         __device__
         static uValueNode* get_node(uNodeIdx idx){
+            if(idx >= gpu_pool.pool_size){
+                printf("blowed up\n");
+                __builtin_trap();
+            }
             return &(gpu_pool.uValue_pool[idx]);
         }
 
@@ -243,8 +252,17 @@ class uValue{
 
         uNodeIdx node = INVALID_NODE;
 
-        __host__ __device__
+        __host__
         uValue(float val){
+            node = uValueNode::new_node();
+            uValueNode::get_node(this->node)->value = val;
+            uValueNode::get_node(this->node)->grad = 0.0f;
+        }
+
+        __device__
+        uValue(float val){
+                        printf("n1\n");
+                __builtin_trap();
             node = uValueNode::new_node();
             uValueNode::get_node(this->node)->value = val;
             uValueNode::get_node(this->node)->grad = 0.0f;
@@ -258,8 +276,19 @@ class uValue{
         }
 
         // _this_arg_is_for_tricking_compiler_ is for shuting up compiler about ambigous
-        __host__ __device__
+        __host__
         uValue(uNodeIdx node_, int _this_arg_is_for_tricking_compiler_){
+            if(node_ >= pool.uValue_pool.size()){
+                printf("bruh1\n");
+            }
+            node = node_;
+        }
+
+        __device__
+        uValue(uNodeIdx node_, int _this_arg_is_for_tricking_compiler_){
+            if(node_ >= gpu_pool.pool_size){
+                printf("bruh2\n");
+            }
             node = node_;
         }
 
@@ -660,6 +689,10 @@ class uNeuron{
 
 __global__
 void _forward_layer_gpu_thread_(uValue* input, uValue output_start, uNeuron* neurons, size_t neuron_count){
+                printf("n1\n");
+                __builtin_trap();
+     uValue y = 0.0f;
+    /*
     uint64_t id = blockIdx.x * blockDim.x + threadIdx.x;
 
     if(id < neuron_count){
@@ -671,10 +704,12 @@ void _forward_layer_gpu_thread_(uValue* input, uValue output_start, uNeuron* neu
         y += neurons[id].bias;
         uValue::from_node(output_start.node + id) = y.sigmoid();
     }
+    */
 }
 
 __global__
 void _train_neuron_gpu_thread_(float learning_rate, uNeuron* neurons, size_t neuron_count){
+    /*
     uint64_t id = blockIdx.x * blockDim.x + threadIdx.x;
 
     if(id < neuron_count){
@@ -683,6 +718,7 @@ void _train_neuron_gpu_thread_(float learning_rate, uNeuron* neurons, size_t neu
         }
         neurons[id].bias = (neurons[id].bias - (neurons[id].bias.get_grad() * learning_rate)).get_value();
     }
+    */
 }
 
 typedef enum{
@@ -1020,6 +1056,7 @@ void read_bigrams(const char* path){
 }
 
 int main(){
+    uNodePool_expand_pool(UValueNodePool_chunk_allocate_count);
 
     read_bigrams("names.txt");
 
